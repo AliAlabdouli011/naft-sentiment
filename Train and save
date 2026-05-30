@@ -1,0 +1,122 @@
+"""
+train_and_save.py
+-----------------
+Trains the NAFT model and saves it to Google Drive.
+Run this once per Colab session if finetuned_model is missing.
+~25 min on GPU.
+"""
+
+import random, os, shutil, torch, numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer
+)
+from sklearn.metrics import f1_score, accuracy_score
+
+random.seed(42); np.random.seed(42); torch.manual_seed(42)
+
+BASE_MODEL  = "distilbert-base-uncased-finetuned-sst-2-english"
+OUTPUT_DIR  = "/content/finetuned_model"
+DRIVE_DIR   = "/content/drive/MyDrive/finetuned_model"
+N_TRAIN     = 2000
+AUG_ALPHAS  = [0.2, 0.4, 0.6]
+EPOCHS      = 3
+BATCH_SIZE  = 16
+
+# ---- Noise functions ----
+ABBREV_MAP = {"you":"u","are":"r","because":"bc","with":"w","the":"da",
+              "and":"n","to":"2","for":"4","your":"ur","though":"tho",
+              "really":"rly","very":"v","what":"wut","that":"dat"}
+SLANG_MAP  = {"good":"lit","great":"fire","bad":"trash","terrible":"sus",
+              "amazing":"bussin","excellent":"goated","awful":"absolute L"}
+SARCASM_PREFIXES = ["Oh sure, ","Yeah right, ","Totally, ","Oh absolutely, "]
+NEUTRAL_EMOJIS   = ["[laugh]","[eyes]","[100]","[think]","[sweat]",
+                    "[flip]","[clap]","[spark]","[fire]","[skull]"]
+
+def apply_all_noise(text, alpha, label=None):
+    import random as r
+    # typo
+    text = "".join(
+        r.choice("abcdefghijklmnopqrstuvwxyz") if c.isalpha() and r.random()<alpha else c
+        for c in text)
+    # abbrev
+    text = " ".join(ABBREV_MAP.get(w.lower().strip(".,!?;:"),w)
+                    if w.lower().strip(".,!?;:") in ABBREV_MAP and r.random()<alpha else w
+                    for w in text.split())
+    # slang
+    text = " ".join(SLANG_MAP.get(w.lower().strip(".,!?;:"),w)
+                    if w.lower().strip(".,!?;:") in SLANG_MAP and r.random()<alpha else w
+                    for w in text.split())
+    # emoji
+    words = text.split(); result = []
+    for w in words:
+        result.append(w)
+        if r.random() < alpha: result.append(r.choice(NEUTRAL_EMOJIS))
+    text = " ".join(result)
+    # punctuation
+    text = "".join("" if c in ".,!?;:" and r.random()<alpha else c for c in text)
+    # sarcasm
+    if label==1 and r.random()<alpha:
+        text = r.choice(SARCASM_PREFIXES) + text[0].lower() + text[1:]
+    return text
+
+class NoisyDataset(torch.utils.data.Dataset):
+    def __init__(self, enc, labels):
+        self.enc = enc; self.labels = labels
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, i):
+        item = {k: torch.tensor(v[i]) for k,v in self.enc.items()}
+        item["labels"] = torch.tensor(self.labels[i])
+        return item
+
+def compute_metrics(ep):
+    preds = np.argmax(ep.predictions, axis=-1)
+    return {"f1": f1_score(ep.label_ids, preds, average="macro"),
+            "acc": accuracy_score(ep.label_ids, preds)}
+
+# ---- Load data ----
+print("Loading SST-2 training data...")
+ds    = load_dataset("stanfordnlp/sst2")["train"]
+pos   = [x for x in ds if x["label"]==1][:N_TRAIN//2]
+neg   = [x for x in ds if x["label"]==0][:N_TRAIN//2]
+train = pos + neg; random.shuffle(train)
+
+# ---- Build augmented dataset ----
+print("Building augmented training set...")
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+texts, labels = [], []
+for s in train:
+    texts.append(s["sentence"]); labels.append(s["label"])
+    for alpha in AUG_ALPHAS:
+        texts.append(apply_all_noise(s["sentence"], alpha, s["label"]))
+        labels.append(s["label"])
+
+print(f"  {len(texts)} examples (original x {1+len(AUG_ALPHAS)})")
+enc = tokenizer(texts, truncation=True, padding=True, max_length=128)
+dataset = NoisyDataset(enc, labels)
+
+# ---- Fine-tune ----
+print(f"Fine-tuning for {EPOCHS} epochs...")
+model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL)
+args  = TrainingArguments(
+    output_dir=OUTPUT_DIR, num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE, learning_rate=2e-5,
+    weight_decay=0.01, logging_steps=100, save_strategy="no",
+    report_to="none")
+Trainer(model=model, args=args, train_dataset=dataset,
+        compute_metrics=compute_metrics).train()
+
+model.save_pretrained(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"Model saved to {OUTPUT_DIR}")
+
+# ---- Save to Drive ----
+if os.path.exists("/content/drive"):
+    if os.path.exists(DRIVE_DIR):
+        shutil.rmtree(DRIVE_DIR)
+    shutil.copytree(OUTPUT_DIR, DRIVE_DIR)
+    print(f"Model backed up to {DRIVE_DIR}")
+else:
+    print("Drive not mounted — skipping Drive backup.")
+    print("Mount Drive with: from google.colab import drive; drive.mount('/content/drive')")
