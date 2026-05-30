@@ -1,0 +1,489 @@
+"""
+SIT330-770 NLP - HD Task 2.3
+Supplementary Experiments
+--------------------------
+Experiment A: EDA fine-tuning baseline (comparison to NAFT)
+Experiment B: Compound noise evaluation (all 6 types simultaneously)
+Experiment C: Ablation over training intensities
+
+Requires:
+    pip install transformers datasets scikit-learn torch accelerate nltk
+
+Usage:
+    python experiment_supplementary.py
+
+Outputs:
+    results_eda.csv          -- Experiment A
+    results_compound.csv     -- Experiment B
+    results_ablation.csv     -- Experiment C
+"""
+
+import random
+import csv
+import os
+import torch
+import numpy as np
+import nltk
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    pipeline,
+)
+from sklearn.metrics import f1_score, accuracy_score
+
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Download WordNet for EDA synonym replacement
+nltk.download("wordnet", quiet=True)
+nltk.download("averaged_perceptron_tagger", quiet=True)
+from nltk.corpus import wordnet
+
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
+import os
+
+BASE_MODEL   = "distilbert-base-uncased-finetuned-sst-2-english"
+NAFT_MODEL   = os.path.abspath("./finetuned_model")
+EDA_DIR      = os.path.abspath("./eda_model")
+N_TEST       = 500
+N_TRAIN_AUG  = 2000
+ALPHAS       = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+AUG_ALPHAS   = [0.2, 0.4, 0.6]
+EPOCHS       = 3
+BATCH_SIZE   = 16
+
+# ---------------------------------------------------------------
+# NOISE FUNCTIONS (copied from experiment_hd.py)
+# ---------------------------------------------------------------
+ABBREV_MAP = {
+    "you": "u", "are": "r", "because": "bc", "before": "b4",
+    "be": "b", "to": "2", "too": "2", "for": "4", "at": "@",
+    "and": "n", "the": "da", "with": "w", "please": "plz",
+    "thanks": "thx", "your": "ur", "okay": "ok", "though": "tho",
+    "through": "thru", "people": "ppl", "about": "abt",
+    "something": "smth", "everyone": "evry1", "someone": "sum1",
+    "what": "wut", "that": "dat", "going": "goin", "doing": "doin",
+    "nothing": "ntn", "everything": "evrthin", "probably": "prob",
+}
+SLANG_MAP = {
+    "good": "lit", "great": "fire", "bad": "trash", "terrible": "sus",
+    "amazing": "bussin", "boring": "mid", "funny": "lol", "sad": "rip",
+    "happy": "stoked", "angry": "heated", "cool": "lowkey fire",
+    "excellent": "goated", "awful": "absolute L", "interesting": "lowkey",
+    "beautiful": "fire", "ugly": "L", "smart": "big brain",
+}
+NEUTRAL_EMOJIS   = ["[laugh]","[eyes]","[100]","[think]","[sweat]",
+                    "[flip]","[clap]","[spark]","[fire]","[skull]"]
+SARCASM_PREFIXES = ["Oh sure, ", "Yeah right, ", "Totally, ", "Oh absolutely, "]
+
+def typo_noise(text, alpha):
+    if alpha == 0.0: return text
+    result = []
+    for ch in list(text):
+        if ch.isalpha() and random.random() < alpha:
+            op = random.choice(["sub","del","dup"])
+            if op == "sub": result.append(random.choice("abcdefghijklmnopqrstuvwxyz"))
+            elif op == "dup": result.extend([ch, ch])
+        else: result.append(ch)
+    return "".join(result)
+
+def abbreviation_noise(text, alpha):
+    if alpha == 0.0: return text
+    return " ".join(ABBREV_MAP.get(w.lower().strip(".,!?;:"), w)
+                    if w.lower().strip(".,!?;:") in ABBREV_MAP and random.random() < alpha
+                    else w for w in text.split())
+
+def slang_noise(text, alpha):
+    if alpha == 0.0: return text
+    return " ".join(SLANG_MAP.get(w.lower().strip(".,!?;:"), w)
+                    if w.lower().strip(".,!?;:") in SLANG_MAP and random.random() < alpha
+                    else w for w in text.split())
+
+def emoji_noise(text, alpha):
+    if alpha == 0.0: return text
+    result = []
+    for w in text.split():
+        result.append(w)
+        if random.random() < alpha: result.append(random.choice(NEUTRAL_EMOJIS))
+    return " ".join(result)
+
+def punctuation_noise(text, alpha):
+    if alpha == 0.0: return text
+    return "".join("" if ch in ".,!?;:" and random.random() < alpha else ch for ch in text)
+
+def sarcasm_noise(text, alpha, label=None):
+    if alpha == 0.0: return text
+    if label == 1 and random.random() < alpha:
+        return random.choice(SARCASM_PREFIXES) + text[0].lower() + text[1:]
+    return text
+
+def apply_all_noise(text, alpha, label=None):
+    text = typo_noise(text, alpha)
+    text = abbreviation_noise(text, alpha)
+    text = slang_noise(text, alpha)
+    text = emoji_noise(text, alpha)
+    text = punctuation_noise(text, alpha)
+    text = sarcasm_noise(text, alpha, label)
+    return text
+
+NOISE_FUNCTIONS = {
+    "typographic":  typo_noise,
+    "abbreviation": abbreviation_noise,
+    "slang":        slang_noise,
+    "emoji":        emoji_noise,
+    "punctuation":  punctuation_noise,
+    "sarcasm":      sarcasm_noise,
+}
+
+# ---------------------------------------------------------------
+# EDA OPERATIONS
+# ---------------------------------------------------------------
+
+def get_synonyms(word):
+    synonyms = set()
+    for syn in wordnet.synsets(word):
+        for lemma in syn.lemmas():
+            s = lemma.name().replace("_", " ")
+            if s.lower() != word.lower():
+                synonyms.add(s)
+    return list(synonyms)
+
+def eda_synonym_replace(text, alpha):
+    """Replace alpha fraction of non-stopword words with synonyms."""
+    words = text.split()
+    n_replace = max(1, int(len(words) * alpha))
+    indices = random.sample(range(len(words)), min(n_replace, len(words)))
+    new_words = words.copy()
+    for idx in indices:
+        syns = get_synonyms(words[idx])
+        if syns:
+            new_words[idx] = random.choice(syns)
+    return " ".join(new_words)
+
+def eda_random_insert(text, alpha):
+    """Insert synonyms of random words at random positions."""
+    words = text.split()
+    n_insert = max(1, int(len(words) * alpha))
+    new_words = words.copy()
+    for _ in range(n_insert):
+        syns = []
+        attempts = 0
+        while not syns and attempts < 10:
+            syns = get_synonyms(random.choice(words))
+            attempts += 1
+        if syns:
+            insert_pos = random.randint(0, len(new_words))
+            new_words.insert(insert_pos, random.choice(syns))
+    return " ".join(new_words)
+
+def eda_random_swap(text, alpha):
+    """Randomly swap pairs of words."""
+    words = text.split()
+    n_swap = max(1, int(len(words) * alpha))
+    new_words = words.copy()
+    for _ in range(n_swap):
+        if len(new_words) >= 2:
+            i, j = random.sample(range(len(new_words)), 2)
+            new_words[i], new_words[j] = new_words[j], new_words[i]
+    return " ".join(new_words)
+
+def eda_random_delete(text, alpha):
+    """Delete each word with probability alpha."""
+    words = text.split()
+    if len(words) == 1:
+        return text
+    new_words = [w for w in words if random.random() > alpha]
+    return " ".join(new_words) if new_words else words[0]
+
+def apply_eda(text, alpha):
+    """Apply all four EDA operations in sequence."""
+    op = random.choice(["synonym", "insert", "swap", "delete"])
+    if op == "synonym": return eda_synonym_replace(text, alpha)
+    elif op == "insert": return eda_random_insert(text, alpha)
+    elif op == "swap":   return eda_random_swap(text, alpha)
+    else:                return eda_random_delete(text, alpha)
+
+# ---------------------------------------------------------------
+# DATA AND EVALUATION UTILITIES
+# ---------------------------------------------------------------
+
+class AugDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels    = labels
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {"macro_f1": f1_score(labels, preds, average="macro"),
+            "accuracy": accuracy_score(labels, preds)}
+
+def load_sst2_splits(n_test, n_train):
+    print("Loading SST-2...")
+    ds = load_dataset("stanfordnlp/sst2")
+    val = ds["validation"]
+    pos = [x for x in val if x["label"]==1][:n_test//2]
+    neg = [x for x in val if x["label"]==0][:n_test//2]
+    test = pos + neg; random.shuffle(test)
+    train = ds["train"]
+    ptr = [x for x in train if x["label"]==1][:n_train//2]
+    ntr = [x for x in train if x["label"]==0][:n_train//2]
+    tr = ptr + ntr; random.shuffle(tr)
+    return ([s["sentence"] for s in test], [s["label"] for s in test], tr)
+
+def evaluate_pipeline(clf, texts, labels, noise_fn=None, alpha=0.0, use_labels=False):
+    if noise_fn and alpha > 0.0:
+        noisy = [noise_fn(t, alpha, l) if use_labels else noise_fn(t, alpha)
+                 for t, l in zip(texts, labels)]
+    else:
+        noisy = texts
+    res = clf(noisy, truncation=True, max_length=512, batch_size=32)
+    preds = [1 if ("POSITIVE" in r["label"].upper() or r["label"].upper()=="LABEL_1")
+             else 0 for r in res]
+    return round(f1_score(labels, preds, average="macro"), 4)
+
+def save_csv(rows, fname):
+    if not rows: return
+    with open(fname, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader(); writer.writerows(rows)
+    print(f"  Saved: {fname}")
+
+# ---------------------------------------------------------------
+# EXPERIMENT A: EDA FINE-TUNING
+# ---------------------------------------------------------------
+
+def train_eda_model(train_samples, aug_alphas, output_dir):
+    print("\n" + "="*55)
+    print("EXPERIMENT A: EDA Fine-Tuning")
+    print("="*55)
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model     = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL)
+
+    texts, labels = [], []
+    for s in train_samples:
+        texts.append(s["sentence"]); labels.append(s["label"])
+        for alpha in aug_alphas:
+            texts.append(apply_eda(s["sentence"], alpha))
+            labels.append(s["label"])
+
+    print(f"  EDA augmented dataset: {len(texts)} examples")
+    enc = tokenizer(texts, truncation=True, padding=True, max_length=128)
+    ds  = AugDataset(enc, labels)
+
+    args = TrainingArguments(
+        output_dir=output_dir, num_train_epochs=EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE, learning_rate=2e-5,
+        weight_decay=0.01, logging_steps=100, save_strategy="no",
+        report_to="none")
+    Trainer(model=model, args=args, train_dataset=ds,
+            compute_metrics=compute_metrics).train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"  EDA model saved to {output_dir}")
+
+def load_local_pipeline(model_path, device):
+    """
+    Load a locally saved model by reading weights directly.
+    Bypasses HuggingFace Hub path validation entirely.
+    """
+    import json, torch
+    from transformers import DistilBertForSequenceClassification, DistilBertTokenizerFast
+
+    # Load tokenizer vocab from saved path
+    tokenizer = DistilBertTokenizerFast.from_pretrained(BASE_MODEL)
+
+    # Load model config from JSON file directly
+    with open(os.path.join(model_path, "config.json")) as f:
+        config_dict = json.load(f)
+    from transformers import DistilBertConfig
+    config = DistilBertConfig(**{k: v for k, v in config_dict.items()
+                                 if k in DistilBertConfig().to_dict()})
+    config.num_labels = config_dict.get("num_labels", 2)
+    config.id2label   = {int(k): v for k, v in
+                         config_dict.get("id2label",
+                         {"0": "NEGATIVE", "1": "POSITIVE"}).items()}
+    config.label2id   = {v: int(k) for k, v in config.id2label.items()}
+
+    model = DistilBertForSequenceClassification(config)
+
+    # Load weights — prefer safetensors, fall back to pytorch_model.bin
+    safetensors_path = os.path.join(model_path, "model.safetensors")
+    pytorch_path     = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path, device="cpu")
+    elif os.path.exists(pytorch_path):
+        state_dict = torch.load(pytorch_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(f"No weights found in {model_path}")
+
+    # Remap legacy LayerNorm key names (beta/gamma -> bias/weight)
+    remap = {k: k.replace(".beta", ".bias").replace(".gamma", ".weight")
+             for k in state_dict if ".beta" in k or ".gamma" in k}
+    for old, new in remap.items():
+        state_dict[new] = state_dict.pop(old)
+
+    model.load_state_dict(state_dict, strict=True)
+    return pipeline("text-classification", model=model,
+                    tokenizer=tokenizer, device=device)
+
+def run_eda_evaluation(test_texts, test_labels):
+    device   = 0 if torch.cuda.is_available() else -1
+    clf_base = pipeline("text-classification", model=BASE_MODEL, device=device)
+    clf_naft = load_local_pipeline(NAFT_MODEL, device)
+    clf_eda  = load_local_pipeline(EDA_DIR, device)
+
+    rows = []
+    for noise_name, noise_fn in NOISE_FUNCTIONS.items():
+        print(f"\n  Noise: {noise_name}")
+        for alpha in ALPHAS:
+            kw = {"use_labels": True} if noise_name == "sarcasm" else {}
+            f1_base = evaluate_pipeline(clf_base, test_texts, test_labels, noise_fn, alpha, **kw)
+            f1_naft = evaluate_pipeline(clf_naft, test_texts, test_labels, noise_fn, alpha, **kw)
+            f1_eda  = evaluate_pipeline(clf_eda,  test_texts, test_labels, noise_fn, alpha, **kw)
+            print(f"    α={alpha:.1f}  Base={f1_base:.4f}  NAFT={f1_naft:.4f}  EDA={f1_eda:.4f}")
+            rows.append({"noise_type": noise_name, "alpha": alpha,
+                         "baseline": f1_base, "naft": f1_naft, "eda": f1_eda})
+    return rows
+
+# ---------------------------------------------------------------
+# EXPERIMENT B: COMPOUND NOISE
+# ---------------------------------------------------------------
+
+def run_compound_noise(test_texts, test_labels):
+    print("\n" + "="*55)
+    print("EXPERIMENT B: Compound Noise Evaluation")
+    print("="*55)
+    device   = 0 if torch.cuda.is_available() else -1
+    clf_base = pipeline("text-classification", model=BASE_MODEL, device=device)
+    clf_naft = load_local_pipeline(NAFT_MODEL, device)
+
+    rows = []
+    for alpha in ALPHAS:
+        noisy = [apply_all_noise(t, alpha, l)
+                 for t, l in zip(test_texts, test_labels)]
+        f1_base = round(f1_score(test_labels,
+            [1 if "POSITIVE" in r["label"].upper() else 0
+             for r in clf_base(noisy, truncation=True, max_length=512, batch_size=32)],
+            average="macro"), 4)
+        f1_naft = round(f1_score(test_labels,
+            [1 if "POSITIVE" in r["label"].upper() else 0
+             for r in clf_naft(noisy, truncation=True, max_length=512, batch_size=32)],
+            average="macro"), 4)
+        print(f"  α={alpha:.1f}  Base={f1_base:.4f}  NAFT={f1_naft:.4f}")
+        rows.append({"alpha": alpha, "baseline": f1_base, "naft": f1_naft,
+                     "delta": round(f1_naft - f1_base, 4)})
+    return rows
+
+# ---------------------------------------------------------------
+# EXPERIMENT C: ABLATION OVER TRAINING INTENSITIES
+# ---------------------------------------------------------------
+
+def train_ablation_model(train_samples, alpha_single, output_dir):
+    print(f"\n  Training NAFT-{alpha_single}...")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model     = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL)
+
+    texts, labels = [], []
+    for s in train_samples:
+        texts.append(s["sentence"]); labels.append(s["label"])
+        texts.append(apply_all_noise(s["sentence"], alpha_single, s["label"]))
+        labels.append(s["label"])
+
+    enc = tokenizer(texts, truncation=True, padding=True, max_length=128)
+    ds  = AugDataset(enc, labels)
+    args = TrainingArguments(
+        output_dir=output_dir, num_train_epochs=EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE, learning_rate=2e-5,
+        weight_decay=0.01, logging_steps=100, save_strategy="no",
+        report_to="none")
+    Trainer(model=model, args=args, train_dataset=ds,
+            compute_metrics=compute_metrics).train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+def run_ablation(test_texts, test_labels, train_samples, ablation_alphas=[0.2, 0.4, 0.6]):
+    print("\n" + "="*55)
+    print("EXPERIMENT C: Ablation over Training Intensities")
+    print("="*55)
+    device  = 0 if torch.cuda.is_available() else -1
+    rows    = []
+    models  = {}
+
+    # Train one model per single alpha
+    for a in ablation_alphas:
+        d = os.path.abspath(f"./ablation_model_{int(a*10)}")
+        train_ablation_model(train_samples, a, d)
+        models[f"naft_{a}"] = load_local_pipeline(
+            os.path.abspath(f"./ablation_model_{int(a*10)}"), device)
+
+    # Also load the full NAFT (all three alphas)
+    models["naft_all"] = load_local_pipeline(NAFT_MODEL, device)
+
+    # Evaluate all ablation models on typographic noise
+    # (most sensitive noise type, so ablation signal is clearest)
+    print("\n  Evaluating on typographic noise (most sensitive):")
+    for alpha in ALPHAS:
+        noisy = [typo_noise(t, alpha) for t in test_texts]
+        row   = {"alpha": alpha}
+        for name, clf in models.items():
+            res   = clf(noisy, truncation=True, max_length=512, batch_size=32)
+            preds = [1 if "POSITIVE" in r["label"].upper() else 0 for r in res]
+            row[name] = round(f1_score(test_labels, preds, average="macro"), 4)
+        print(f"  α={alpha:.1f}  " +
+              "  ".join(f"{k}={v:.4f}" for k, v in row.items() if k != "alpha"))
+        rows.append(row)
+    return rows
+
+# ---------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------
+
+if __name__ == "__main__":
+    device = 0 if torch.cuda.is_available() else -1
+    print(f"Device: {'GPU' if device == 0 else 'CPU'}")
+
+    # Check NAFT model exists before starting
+    if not os.path.exists(os.path.join(NAFT_MODEL, "config.json")):
+        raise FileNotFoundError(
+            f"\n\nNAFT model not found at: {NAFT_MODEL}\n"
+            "Please re-run experiment_hd.py first to train and save the model,\n"
+            "or copy it from Google Drive if you saved it there.\n"
+            "To save to Drive after training, add:\n"
+            "  import shutil\n"
+            "  shutil.copytree('./finetuned_model', '/content/drive/MyDrive/finetuned_model')\n"
+        )
+
+    test_texts, test_labels, train_samples = load_sst2_splits(N_TEST, N_TRAIN_AUG)
+
+    # --- Experiment B: Compound noise (no new training needed) ---
+    compound_rows = run_compound_noise(test_texts, test_labels)
+    save_csv(compound_rows, "results_compound.csv")
+
+    # --- Experiment A: EDA fine-tuning ---
+    if not os.path.exists(EDA_DIR):
+        train_eda_model(train_samples, AUG_ALPHAS, EDA_DIR)
+    eda_rows = run_eda_evaluation(test_texts, test_labels)
+    save_csv(eda_rows, "results_eda.csv")
+
+    # --- Experiment C: Ablation ---
+    # Re-load train samples fresh for ablation
+    _, _, train_samples_fresh = load_sst2_splits(N_TEST, N_TRAIN_AUG)
+    ablation_rows = run_ablation(test_texts, test_labels, train_samples_fresh)
+    save_csv(ablation_rows, "results_ablation.csv")
+
+    print("\nAll experiments complete.")
+    print("Bring results_eda.csv, results_compound.csv, results_ablation.csv")
+    print("back to update the paper.")
