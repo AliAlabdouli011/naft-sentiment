@@ -1,0 +1,409 @@
+"""
+SIT330-770 NLP - HD Task 2.3
+Noise-Augmented Fine-Tuning Experiment
+---------------------------------------
+Phase 1: Evaluate baseline model (SST-2 trained) under incremental noise
+Phase 2: Fine-tune baseline on noise-augmented SST-2 training data
+Phase 3: Evaluate fine-tuned model under same noise conditions
+Phase 4: Compare degradation curves (baseline vs proposed method)
+
+Requirements:
+    pip install transformers datasets scikit-learn torch accelerate
+
+Usage:
+    python experiment_hd.py
+
+Outputs:
+    results_baseline.csv   -- Phase 1 results
+    results_finetuned.csv  -- Phase 3 results
+    results_combined.csv   -- Both models side by side for paper tables
+"""
+
+import random
+import csv
+import os
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    pipeline,
+)
+from sklearn.metrics import f1_score, accuracy_score
+
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
+BASE_MODEL      = "distilbert-base-uncased-finetuned-sst-2-english"
+N_TEST          = 500        # test samples (increase for final run)
+N_TRAIN_AUG     = 2000       # augmented training samples
+ALPHAS          = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+AUG_ALPHAS      = [0.2, 0.4, 0.6]   # α levels used during augmentation
+EPOCHS          = 3
+BATCH_SIZE      = 16
+OUTPUT_DIR      = "./finetuned_model"
+
+# ---------------------------------------------------------------
+# LEXICONS
+# ---------------------------------------------------------------
+ABBREV_MAP = {
+    "you": "u", "are": "r", "because": "bc", "before": "b4",
+    "be": "b", "to": "2", "too": "2", "for": "4", "at": "@",
+    "and": "n", "the": "da", "with": "w", "please": "plz",
+    "thanks": "thx", "your": "ur", "okay": "ok", "though": "tho",
+    "through": "thru", "people": "ppl", "about": "abt",
+    "something": "smth", "everyone": "evry1", "someone": "sum1",
+    "what": "wut", "that": "dat", "going": "goin", "doing": "doin",
+    "nothing": "ntn", "everything": "evrthin", "probably": "prob",
+}
+
+SLANG_MAP = {
+    "good": "lit", "great": "fire", "bad": "trash", "terrible": "sus",
+    "amazing": "bussin", "boring": "mid", "funny": "lol", "sad": "rip",
+    "happy": "stoked", "angry": "heated", "cool": "lowkey fire",
+    "excellent": "goated", "awful": "absolute L", "interesting": "lowkey",
+    "beautiful": "fire", "ugly": "L", "smart": "big brain",
+}
+
+NEUTRAL_EMOJIS  = ["😂", "👀", "💯", "🤔", "😅", "🙃", "👏", "✨", "🔥", "💀"]
+SARCASM_PREFIXES = ["Oh sure, ", "Yeah right, ", "Totally, ", "Oh absolutely, "]
+
+# ---------------------------------------------------------------
+# NOISE FUNCTIONS  (alpha = fraction of eligible tokens perturbed)
+# ---------------------------------------------------------------
+
+def typo_noise(text, alpha):
+    if alpha == 0.0:
+        return text
+    chars, result = list(text), []
+    for ch in chars:
+        if ch.isalpha() and random.random() < alpha:
+            op = random.choice(["sub", "del", "dup"])
+            if op == "sub":
+                result.append(random.choice("abcdefghijklmnopqrstuvwxyz"))
+            elif op == "dup":
+                result.extend([ch, ch])
+            # "del" => skip
+        else:
+            result.append(ch)
+    return "".join(result)
+
+def abbreviation_noise(text, alpha):
+    if alpha == 0.0:
+        return text
+    words = text.split()
+    return " ".join(
+        ABBREV_MAP[w.lower().strip(".,!?;:")] if w.lower().strip(".,!?;:") in ABBREV_MAP
+        and random.random() < alpha else w
+        for w in words
+    )
+
+def slang_noise(text, alpha):
+    if alpha == 0.0:
+        return text
+    words = text.split()
+    return " ".join(
+        SLANG_MAP[w.lower().strip(".,!?;:")] if w.lower().strip(".,!?;:") in SLANG_MAP
+        and random.random() < alpha else w
+        for w in words
+    )
+
+def emoji_noise(text, alpha):
+    if alpha == 0.0:
+        return text
+    words = text.split()
+    result = []
+    for w in words:
+        result.append(w)
+        if random.random() < alpha:
+            result.append(random.choice(NEUTRAL_EMOJIS))
+    return " ".join(result)
+
+def punctuation_noise(text, alpha):
+    if alpha == 0.0:
+        return text
+    return "".join(
+        "" if ch in ".,!?;:" and random.random() < alpha else ch
+        for ch in text
+    )
+
+def sarcasm_noise(text, alpha, label=None):
+    if alpha == 0.0:
+        return text
+    if label == 1 and random.random() < alpha:
+        return random.choice(SARCASM_PREFIXES) + text[0].lower() + text[1:]
+    return text
+
+def apply_all_noise(text, alpha, label=None):
+    """Apply all noise types simultaneously at given alpha."""
+    text = typo_noise(text, alpha)
+    text = abbreviation_noise(text, alpha)
+    text = slang_noise(text, alpha)
+    text = emoji_noise(text, alpha)
+    text = punctuation_noise(text, alpha)
+    text = sarcasm_noise(text, alpha, label)
+    return text
+
+NOISE_FUNCTIONS = {
+    "typographic":  typo_noise,
+    "abbreviation": abbreviation_noise,
+    "slang":        slang_noise,
+    "emoji":        emoji_noise,
+    "punctuation":  punctuation_noise,
+    "sarcasm":      sarcasm_noise,
+}
+
+# ---------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------
+
+def load_sst2_splits(n_test, n_train):
+    print("Loading SST-2 dataset...")
+    dataset = load_dataset("sst2")
+
+    # Test set (balanced)
+    val = dataset["validation"]
+    pos = [x for x in val if x["label"] == 1][:n_test // 2]
+    neg = [x for x in val if x["label"] == 0][:n_test // 2]
+    test_samples = pos + neg
+    random.shuffle(test_samples)
+    test_texts  = [s["sentence"] for s in test_samples]
+    test_labels = [s["label"]    for s in test_samples]
+
+    # Train set (for augmentation)
+    train = dataset["train"]
+    pos_tr = [x for x in train if x["label"] == 1][:n_train // 2]
+    neg_tr = [x for x in train if x["label"] == 0][:n_train // 2]
+    train_samples = pos_tr + neg_tr
+    random.shuffle(train_samples)
+
+    return test_texts, test_labels, train_samples
+
+# ---------------------------------------------------------------
+# PHASE 1: BASELINE EVALUATION
+# ---------------------------------------------------------------
+
+def evaluate_model(clf, texts, labels, noise_fn=None, alpha=0.0, noise_label=None):
+    """Apply noise and evaluate macro-F1 and accuracy."""
+    if noise_fn is not None and alpha > 0.0:
+        if noise_label is not None:
+            noisy = [noise_fn(t, alpha, l) for t, l in zip(texts, labels)]
+        else:
+            noisy = [noise_fn(t, alpha) for t in texts]
+    else:
+        noisy = texts
+
+    results = clf(noisy, truncation=True, max_length=512, batch_size=32)
+    preds = []
+    for r in results:
+        label_str = r["label"].upper()
+        preds.append(1 if ("POSITIVE" in label_str or label_str == "LABEL_1") else 0)
+
+    f1  = f1_score(labels, preds, average="macro")
+    acc = accuracy_score(labels, preds)
+    return round(f1, 4), round(acc, 4)
+
+def run_baseline_evaluation(clf, test_texts, test_labels):
+    print("\n" + "="*55)
+    print("PHASE 1: Baseline Evaluation")
+    print("="*55)
+    rows = []
+    for noise_name, noise_fn in NOISE_FUNCTIONS.items():
+        print(f"\n  Noise: {noise_name}")
+        for alpha in ALPHAS:
+            kw = {"noise_label": test_labels} if noise_name == "sarcasm" else {}
+            f1, acc = evaluate_model(
+                clf, test_texts, test_labels, noise_fn, alpha, **kw)
+            print(f"    α={alpha:.1f}  F1={f1:.4f}  Acc={acc:.4f}")
+            rows.append({
+                "model": "baseline", "noise_type": noise_name,
+                "alpha": alpha, "macro_f1": f1, "accuracy": acc
+            })
+    return rows
+
+# ---------------------------------------------------------------
+# PHASE 2: NOISE-AUGMENTED FINE-TUNING
+# ---------------------------------------------------------------
+
+class NoisyDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels    = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
+
+def build_augmented_dataset(train_samples, tokenizer, aug_alphas):
+    """
+    Build an augmented training set by creating noisy copies of each
+    training example at each alpha level in aug_alphas.
+    """
+    print("\nBuilding noise-augmented training set...")
+    aug_texts, aug_labels = [], []
+
+    for sample in train_samples:
+        text, label = sample["sentence"], sample["label"]
+        # Keep original
+        aug_texts.append(text)
+        aug_labels.append(label)
+        # Add noisy copies at each augmentation alpha
+        for alpha in aug_alphas:
+            noisy = apply_all_noise(text, alpha, label)
+            aug_texts.append(noisy)
+            aug_labels.append(label)
+
+    print(f"  Augmented dataset size: {len(aug_texts)} examples "
+          f"(original × {1 + len(aug_alphas)})")
+
+    encodings = tokenizer(
+        aug_texts, truncation=True, padding=True, max_length=128)
+    return NoisyDataset(encodings, aug_labels)
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "macro_f1": f1_score(labels, preds, average="macro"),
+        "accuracy": accuracy_score(labels, preds),
+    }
+
+def fine_tune_model(train_samples, output_dir):
+    print("\n" + "="*55)
+    print("PHASE 2: Noise-Augmented Fine-Tuning")
+    print("="*55)
+
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model     = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL)
+
+    train_dataset = build_augmented_dataset(train_samples, tokenizer, AUG_ALPHAS)
+
+    training_args = TrainingArguments(
+        output_dir          = output_dir,
+        num_train_epochs    = EPOCHS,
+        per_device_train_batch_size = BATCH_SIZE,
+        learning_rate       = 2e-5,
+        weight_decay        = 0.01,
+        logging_steps       = 50,
+        save_strategy       = "no",
+        report_to           = "none",
+    )
+
+    trainer = Trainer(
+        model          = model,
+        args           = training_args,
+        train_dataset  = train_dataset,
+        compute_metrics= compute_metrics,
+    )
+
+    print(f"  Training for {EPOCHS} epochs on "
+          f"{len(train_dataset)} augmented examples...")
+    trainer.train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"  Model saved to {output_dir}")
+    return output_dir
+
+# ---------------------------------------------------------------
+# PHASE 3: FINE-TUNED MODEL EVALUATION
+# ---------------------------------------------------------------
+
+def run_finetuned_evaluation(output_dir, test_texts, test_labels):
+    print("\n" + "="*55)
+    print("PHASE 3: Fine-Tuned Model Evaluation")
+    print("="*55)
+
+    device = 0 if torch.cuda.is_available() else -1
+    clf = pipeline("text-classification", model=output_dir, device=device)
+
+    rows = []
+    for noise_name, noise_fn in NOISE_FUNCTIONS.items():
+        print(f"\n  Noise: {noise_name}")
+        for alpha in ALPHAS:
+            kw = {"noise_label": test_labels} if noise_name == "sarcasm" else {}
+            f1, acc = evaluate_model(
+                clf, test_texts, test_labels, noise_fn, alpha, **kw)
+            print(f"    α={alpha:.1f}  F1={f1:.4f}  Acc={acc:.4f}")
+            rows.append({
+                "model": "noise_augmented", "noise_type": noise_name,
+                "alpha": alpha, "macro_f1": f1, "accuracy": acc
+            })
+    return rows
+
+# ---------------------------------------------------------------
+# SAVE RESULTS
+# ---------------------------------------------------------------
+
+def save_csv(rows, filename):
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["model", "noise_type", "alpha", "macro_f1", "accuracy"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Saved: {filename}")
+
+def print_comparison(baseline_rows, finetuned_rows):
+    """Print a side-by-side comparison table."""
+    from collections import defaultdict
+    base = {(r["noise_type"], r["alpha"]): r["macro_f1"] for r in baseline_rows}
+    fine = {(r["noise_type"], r["alpha"]): r["macro_f1"] for r in finetuned_rows}
+
+    print("\n" + "="*65)
+    print("PHASE 4: Comparison Summary (Macro-F1)")
+    print("="*65)
+
+    for noise_name in NOISE_FUNCTIONS:
+        print(f"\n  {noise_name.upper()}")
+        print(f"  {'α':>4}  {'Baseline':>10}  {'Noise-Aug':>10}  {'Delta':>8}")
+        for alpha in ALPHAS:
+            b = base.get((noise_name, alpha), float("nan"))
+            f = fine.get((noise_name, alpha), float("nan"))
+            d = f - b if not (np.isnan(b) or np.isnan(f)) else float("nan")
+            print(f"  {alpha:>4.1f}  {b:>10.4f}  {f:>10.4f}  {d:>+8.4f}")
+
+# ---------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------
+
+if __name__ == "__main__":
+    device = 0 if torch.cuda.is_available() else -1
+    print(f"Device: {'GPU' if device == 0 else 'CPU'}")
+
+    # Load data
+    test_texts, test_labels, train_samples = load_sst2_splits(
+        N_TEST, N_TRAIN_AUG)
+
+    # Phase 1: Baseline
+    print("\nLoading baseline model...")
+    baseline_clf = pipeline(
+        "text-classification", model=BASE_MODEL, device=device)
+    baseline_rows = run_baseline_evaluation(
+        baseline_clf, test_texts, test_labels)
+    save_csv(baseline_rows, "results_baseline.csv")
+    del baseline_clf  # free memory before fine-tuning
+
+    # Phase 2: Fine-tune
+    fine_tune_model(train_samples, OUTPUT_DIR)
+
+    # Phase 3: Evaluate fine-tuned model
+    finetuned_rows = run_finetuned_evaluation(
+        OUTPUT_DIR, test_texts, test_labels)
+    save_csv(finetuned_rows, "results_finetuned.csv")
+
+    # Phase 4: Combined CSV + comparison table
+    all_rows = baseline_rows + finetuned_rows
+    save_csv(all_rows, "results_combined.csv")
+    print_comparison(baseline_rows, finetuned_rows)
+
+    print("\nDone. Bring results_combined.csv back to update the paper.")
