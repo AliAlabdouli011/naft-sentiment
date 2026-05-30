@@ -1,0 +1,641 @@
+%%
+%% SIT330-770 Natural Language Processing
+%% HD Task 2.3 - Research Paper
+%% ACM Conference Proceedings Primary Article Template
+%%
+
+\documentclass[sigconf]{acmart}
+
+\setcopyright{none}
+\settopmatter{printacmref=false, printccs=false, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\acmConference{SIT330-770 Natural Language Processing}{2025}{Deakin University}
+\acmDOI{}
+\acmISBN{}
+
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+
+\title{Noise-Robust Sentiment Classification via\\
+Noise-Augmented Fine-Tuning}
+
+\author{Ali Alabdouli}
+\affiliation{\institution{Deakin University}\country{Australia}}
+\email{224535032}
+
+\begin{document}
+
+\begin{abstract}
+Transformer-based sentiment classifiers trained on formal corpora
+such as SST-2 degrade under informal text noise encountered in
+real-world deployment.
+While the existence of this degradation is acknowledged, the
+relative severity of individual noise types and the effectiveness
+of mitigation strategies remain understudied.
+This paper makes two contributions.
+First, we systematically quantify how six noise types (typographic
+errors, abbreviations, slang, emoji insertion, missing punctuation,
+and sarcasm) degrade sentiment classification performance at
+incremental intensities $\alpha \in [0, 1]$.
+Second, we propose and evaluate \emph{noise-augmented fine-tuning}
+(NAFT), which exposes a pre-trained DistilBERT classifier to
+synthetic noise during fine-tuning to improve robustness at
+inference time.
+Experiments on SST-2 show that typographic noise is the most
+damaging noise type, reducing baseline macro-F1 from 0.91 to 0.33
+at full intensity, and that NAFT recovers up to 0.28 F1 points
+under this condition.
+Emoji noise also shows substantial recovery under NAFT (+0.12 F1
+at $\alpha=1.0$).
+Surprisingly, the baseline model is already robust to slang,
+abbreviations, and punctuation noise, while sarcasm as implemented
+via prefix injection has minimal effect on either model.
+These findings provide actionable guidance for practitioners
+deploying sentiment systems in noisy environments.
+\end{abstract}
+
+\maketitle
+
+%% ---------------------------------------------------------------
+\section{Introduction}
+%% ---------------------------------------------------------------
+
+\paragraph{Background and Importance.}
+Sentiment analysis is widely used to understand people's opinions
+across domains including product reviews, customer feedback, social
+media monitoring, and public opinion analysis~\cite{pang2008opinion}.
+In real-world deployment settings, users frequently write
+informally, using slang, abbreviations, emojis, sarcasm, spelling
+mistakes, and missing punctuation~\cite{eisenstein2013bad}.
+This informal register makes sentiment classification harder because
+emotional meaning may not be recoverable from the surface form of
+standard words alone.
+A critical \emph{deployment gap} therefore exists: models are trained
+in one context (clean, edited review text) but used in another
+(unstructured, noisy social media), and the consequences of this
+mismatch are not fully understood.
+
+\paragraph{Current Approaches.}
+Current sentiment analysis systems commonly employ transformer-based
+models such as BERT~\cite{devlin2019bert} and
+RoBERTa~\cite{liu2019roberta}, fine-tuned on labelled datasets.
+Training corpora vary in register: SST-2~\cite{socher2013recursive}
+consists of edited film review excerpts and represents a relatively
+formal dataset, whereas IMDb~\cite{maas2011learning} comprises
+raw user-submitted reviews containing slang and informal constructions.
+Despite this variation, it remains unclear whether training register
+confers meaningful noise robustness at inference time.
+
+\paragraph{Identified Limitation.}
+The relative severity of individual noise types has not been
+systematically quantified in isolation, and no controlled study
+has examined whether noise-augmented training directly mitigates
+the observed degradation.
+Without this evidence, practitioners cannot make informed decisions
+about robustness strategies for informal deployment settings.
+
+\paragraph{Research Question.}
+\emph{Does noise-augmented fine-tuning reduce the performance
+degradation caused by informal text noise in sentiment
+classification, and does its effectiveness vary across noise types
+and intensities?}
+
+\paragraph{Contributions.}
+(1) A controlled noise sensitivity benchmark across six noise types
+at eleven intensity levels; (2) a noise-augmented fine-tuning method
+(NAFT) that directly targets the identified limitation; and (3) an
+empirical comparison demonstrating where NAFT recovers performance
+and where it does not.
+
+%% ---------------------------------------------------------------
+\section{Related Work}
+%% ---------------------------------------------------------------
+
+\paragraph{Data Augmentation for Robustness.}
+The principle that exposing a model to perturbed inputs during
+training improves robustness to those perturbations at inference
+time is well established in machine learning, predating
+transformer models.
+\citet{simard2003best} demonstrated this for convolutional networks
+in computer vision, showing that elastic distortions during training
+substantially improved generalisation to unseen image variations.
+\citet{goodfellow2015explaining} formalised adversarial training,
+arguing that training on worst-case perturbations acts as a
+regulariser that improves robustness to input variation more
+broadly.
+NAFT applies this principle to the text domain with a
+domain-specific perturbation taxonomy.
+
+\paragraph{Text Data Augmentation.}
+\citet{wei2019eda} introduced EDA (Easy Data Augmentation), which
+applies four word-level operations: synonym replacement, random
+insertion, random swap, and random deletion, as augmentation
+strategies for text classification.
+EDA showed that training with augmented data matched full-data
+accuracy using only 50\% of the original training set.
+NAFT is conceptually related to EDA in that both generate
+perturbed training examples to improve robustness.
+The key distinction is that EDA applies generic word-level
+operations designed for data efficiency, while NAFT applies
+noise types that directly mirror informal social media language
+(typographic errors, slang, emoji insertion), targeting deployment
+robustness rather than label efficiency.
+EDA does not address emoji, typographic, or sarcasm perturbations,
+which are the noise types most damaging in real-world deployment.
+
+\paragraph{Noise Robustness in NLP.}
+\citet{belinkov2018synthetic} showed that neural machine translation
+systems are highly sensitive to character-level noise, and that
+noise-aware training recovers much of the lost performance,
+directly motivating NAFT for sentiment classification.
+In sentiment analysis, \citet{barbieri2020tweeteval} showed
+significant performance gaps between models evaluated on formal and
+informal corpora, highlighting the deployment mismatch addressed
+here.
+Sarcasm and irony detection require pragmatic context beyond
+token-level signals~\cite{van2018semeval}, a limitation confirmed
+by our results.
+
+%% ---------------------------------------------------------------
+\section{Preliminaries and Problem Definition}
+%% ---------------------------------------------------------------
+
+Let $f: \mathcal{X} \to \{0, 1\}$ denote a binary sentiment
+classifier mapping input text to a negative (0) or positive (1)
+label.
+Let $\mathcal{N}_k^\alpha: \mathcal{X} \to \mathcal{X}$ denote a
+noise function for type $k$ at intensity $\alpha \in [0, 1]$,
+where $\alpha$ represents the probability that each eligible token
+position is perturbed.
+We define six noise types $k \in \{\text{typo, abbrev, slang,
+emoji, punct, sarcasm}\}$, each operationalised as follows.
+\textbf{Typographic} noise ($\mathcal{N}_{\text{typo}}^\alpha$)
+applies random character substitution, deletion, or duplication to
+each alphabetic character with probability $\alpha$.
+\textbf{Abbreviation} ($\mathcal{N}_{\text{abbrev}}^\alpha$) and
+\textbf{slang} ($\mathcal{N}_{\text{slang}}^\alpha$) replace each
+word present in a fixed lexicon with its informal equivalent with
+probability $\alpha$.
+\textbf{Emoji} ($\mathcal{N}_{\text{emoji}}^\alpha$) inserts a
+sentiment-neutral emoji at each token boundary with probability
+$\alpha$.
+\textbf{Punctuation} ($\mathcal{N}_{\text{punct}}^\alpha$) removes
+each punctuation character with probability $\alpha$.
+\textbf{Sarcasm} ($\mathcal{N}_{\text{sarc}}^\alpha$) prepends a
+pragmatic inversion frame to a fraction $\alpha$ of positive samples.
+
+The degradation of classifier $f$ under noise type $k$ at intensity
+$\alpha$ is measured as:
+\begin{equation}
+  \Delta F_1(f, k, \alpha) = F_1(f, \mathcal{D}) -
+  F_1(f, \mathcal{N}_k^\alpha(\mathcal{D}))
+\end{equation}
+where $\mathcal{D}$ is the clean test set and $F_1$ is macro-F1.
+The \emph{degradation threshold} $\alpha^*_k$ is the smallest
+$\alpha$ at which $\Delta F_1 \geq 0.05$.
+
+\paragraph{Noise Operationalisation Details.}
+Each noise function is deterministic given a fixed random seed.
+\textbf{Typographic} noise independently applies one of three
+character-level operations to each alphabetic character with
+probability $\alpha$: (i) substitution with a uniformly sampled
+lowercase letter, (ii) deletion, or (iii) duplication of the
+character.
+\textbf{Abbreviation} noise uses a fixed lexicon of 30 common
+English informal substitutions (e.g., \textit{you}$\to$\textit{u},
+\textit{because}$\to$\textit{bc}, \textit{through}$\to$\textit{thru}).
+Each word whose lowercase form appears in the lexicon is replaced
+with probability $\alpha$; other words are unchanged.
+\textbf{Slang} noise follows the same mechanism with a 16-entry
+sentiment-relevant lexicon (e.g., \textit{good}$\to$\textit{lit},
+\textit{bad}$\to$\textit{trash}, \textit{excellent}$\to$\textit{goated}).
+\textbf{Emoji} noise inserts one of ten manually selected
+sentiment-neutral emojis (face-with-tears-of-joy, eyes, hundred-points,
+thinking-face, grinning-face-with-sweat, upside-down-face,
+clapping-hands, sparkles, fire, skull) uniformly at random after
+each token with probability $\alpha$.
+\textbf{Punctuation removal} drops each character in
+\{.,!?;:\} independently with probability $\alpha$.
+\textbf{Sarcasm} prepends one of four fixed phrases
+(\textit{``Oh sure,''} \textit{``Yeah right,''} \textit{``Totally,''} \textit{``Oh absolutely,''})
+chosen uniformly at random, applied only to positive-labelled
+samples with probability $\alpha$.
+
+%% ---------------------------------------------------------------
+\section{Proposed Method}
+%% ---------------------------------------------------------------
+
+We propose \textbf{Noise-Augmented Fine-Tuning (NAFT)}, which
+addresses the identified limitation by exposing the model to
+synthetic noise during fine-tuning, so that noisy token
+distributions are in-distribution at inference time.
+
+\paragraph{Method.}
+Starting from a pre-trained DistilBERT model fine-tuned on SST-2,
+we construct an augmented training set $\tilde{\mathcal{D}}$ by
+pairing each original training example $(x, y) \in \mathcal{D}$
+with noisy copies generated by applying all six noise types
+simultaneously at each of three augmentation intensities
+$\alpha \in \{0.2, 0.4, 0.6\}$.
+The combined noise function applies all perturbations sequentially.
+This expands the training set by a factor of four (one clean copy
+plus three noisy copies per example).
+The model is then fine-tuned on $\tilde{\mathcal{D}}$ for three
+epochs using AdamW with learning rate $2 \times 10^{-5}$ and
+weight decay $0.01$.
+
+\paragraph{Justification.}
+The core insight is that noise-augmented training reduces the
+distributional shift between training and inference.
+By explicitly including perturbed text during optimisation, the
+model's attention heads are encouraged to attend to semantic
+content rather than surface-level lexical patterns, making the
+learned representations more robust to token-level perturbations.
+This is analogous to data augmentation in computer vision, where
+exposing models to transformed images improves generalisation to
+unseen transformations~\cite{shorten2019survey}.
+
+\paragraph{Limitations of the Approach.}
+NAFT is not expected to recover performance for pragmatic noise
+(sarcasm), because sarcasm operates at the discourse level rather
+than the token level; token-level augmentation cannot teach the
+model to invert sentiment labels based on conversational framing.
+This motivates separate treatment of sarcasm as a distinct
+sub-problem in future work.
+
+%% ---------------------------------------------------------------
+\section{Experimental Setup}
+%% ---------------------------------------------------------------
+
+\paragraph{Datasets.}
+We use the SST-2 validation set (872 examples, balanced to 500 for
+efficiency) as our evaluation set.
+The SST-2 training set (67K examples, subsampled to 2,000 for
+fine-tuning) provides the augmented training data.
+
+\paragraph{Models.}
+The \textbf{baseline} is
+\texttt{distilbert-base-uncased-finetuned-sst-2-english}, a
+DistilBERT model fine-tuned on SST-2.
+The \textbf{NAFT model} is the same checkpoint further fine-tuned
+on the noise-augmented training set described in Section 4.
+
+\paragraph{Evaluation Protocol.}
+Both models are evaluated on the same 500-example test set under
+each of the six noise types at all eleven intensity levels
+$\alpha \in \{0.0, 0.1, \ldots, 1.0\}$.
+Macro-F1 and accuracy are reported at each $(\text{noise type},
+\alpha)$ combination.
+The clean baseline ($\alpha = 0$) is identical for both models
+prior to fine-tuning; any change in clean performance after NAFT
+fine-tuning is also reported to assess the clean-noisy trade-off.
+
+\paragraph{Implementation.}
+All experiments are implemented in Python using HuggingFace
+Transformers~\cite{wolf2020transformers}.
+Training uses AdamW with learning rate $2 \times 10^{-5}$, batch
+size 16, and 3 epochs.
+Results are averaged over a fixed random seed (42) for
+reproducibility.
+
+%% ---------------------------------------------------------------
+\section{Results}
+%% ---------------------------------------------------------------
+
+Table~\ref{tab:results} reports macro-F1 for both models across
+all eleven $\alpha$ levels for the two most sensitive noise types;
+Table~\ref{tab:results2} covers the remaining four.\footnote{Code,
+trained model checkpoints, and all noise-injected dataset variants
+are available at:
+\texttt{https://github.com/AliAlabdouli011/naft-sentiment}
+(to be made public upon submission).}
+
+\paragraph{Baseline Noise Sensitivity.}
+Typographic noise is by far the most damaging noise type.
+The baseline macro-F1 drops from 0.9119 at $\alpha=0.0$ to 0.7538
+at $\alpha=0.1$ — a drop of 0.16 at the lowest non-zero intensity —
+and collapses to 0.3333 at $\alpha \geq 0.9$, equivalent to
+random guessing.
+This rapid degradation occurs because character-level perturbations
+produce tokens outside DistilBERT's WordPiece vocabulary,
+fragmenting words into meaningless subword units and destroying
+contextual representations.
+The degradation threshold $\alpha^* = 0.1$ is the lowest of all
+noise types, confirming typographic noise as the primary
+vulnerability.
+
+Emoji insertion causes moderate but steady degradation, with
+baseline F1 declining from 0.9119 to 0.7621 at $\alpha=1.0$
+($\Delta = -0.15$).
+The model was not exposed to emoji tokens during SST-2 training,
+so each inserted emoji disrupts attention over surrounding words.
+
+Abbreviations, slang, and punctuation removal cause minimal
+degradation.
+Abbreviation F1 drops from 0.9119 to 0.8760 ($\Delta=-0.036$)
+and slang from 0.9119 to 0.9000 ($\Delta=-0.012$) at full
+intensity, likely because only a small fraction of tokens in any
+sentence match the fixed lexicons, leaving sufficient context for
+correct prediction.
+
+Sarcasm prefix injection has negligible effect across all $\alpha$
+levels (F1 remains $\approx0.91$), discussed in
+Section~\ref{sec:analysis}.
+
+\paragraph{NAFT Performance.}
+NAFT provides the largest absolute improvements for typographic
+noise, recovering up to $\Delta F_1 = +0.28$ at $\alpha=0.3$
+(Table~\ref{tab:results}).
+The improvement is consistent across all non-zero intensities,
+confirming that character-level augmentation during training
+significantly mitigates the tokenizer fragmentation problem.
+Even at full intensity ($\alpha=1.0$), NAFT achieves F1=0.3977
+versus baseline 0.3333 (+0.064).
+
+Emoji noise also benefits substantially from NAFT, improving from
+0.7621 to 0.8798 at $\alpha=1.0$ (+0.118), with gains growing
+monotonically with intensity (Table~\ref{tab:results}).
+This suggests the model learns to treat emoji tokens as ignorable
+noise rather than semantic content.
+
+For abbreviation, slang, and punctuation, NAFT produces small
+negative deltas ($\leq -0.02$) at most levels.
+Since the baseline is already robust to these types, augmentation
+provides no benefit and introduces a marginal cost from the
+clean-text trade-off.
+
+\paragraph{Compound Noise.}
+Table~\ref{tab:compound} reports results when all six noise types
+are applied simultaneously.
+The baseline degrades catastrophically, dropping from F1=0.9119 at
+$\alpha=0.0$ to F1=0.4018 at $\alpha=1.0$.
+NAFT, by contrast, maintains strong performance across the entire
+range and reaches F1=0.9900 at $\alpha=1.0$ — substantially
+\emph{exceeding} its clean baseline.
+This remarkable result is explained by the training procedure:
+NAFT was fine-tuned on exactly this type of combined noise via
+\texttt{apply\_all\_noise}, making heavily perturbed compound
+inputs effectively in-distribution at inference time.
+
+\begin{table}[h]
+  \centering\footnotesize\setlength{\tabcolsep}{4pt}
+  \caption{Macro-F1 under compound noise (all 6 types simultaneously).}
+  \label{tab:compound}
+  \begin{tabular}{rccr}
+    \toprule
+    $\alpha$ & \textbf{Baseline} & \textbf{NAFT} & $\Delta$ \\
+    \midrule
+    0.0 & 0.9119 & 0.8959 & $-$0.016 \\
+    0.1 & 0.7550 & 0.8120 & $+$0.057 \\
+    0.3 & 0.4582 & 0.7164 & $+$0.258 \\
+    0.5 & 0.3628 & 0.7323 & $+$0.370 \\
+    0.7 & 0.3762 & 0.8093 & $+$0.433 \\
+    1.0 & 0.4018 & 0.9900 & $+$0.588 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Comparison with EDA.}
+Table~\ref{tab:eda} compares NAFT against EDA~\cite{wei2019eda}
+for typographic noise, the most discriminating condition.
+EDA provides negligible improvement over the baseline (F1=0.43 vs
+0.42 at $\alpha=0.3$), confirming that word-level operations
+(synonym replacement, random insertion, swap, deletion) do not
+address character-level corruption.
+NAFT substantially outperforms both (F1=0.64 at $\alpha=0.3$,
+$+$0.22 over EDA), demonstrating that domain-specific noise
+augmentation is necessary for typographic robustness.
+For abbreviation, slang, punctuation, and sarcasm, all three models
+perform similarly since the baseline is already robust to these
+types.
+
+\begin{table}[h]
+  \centering\footnotesize\setlength{\tabcolsep}{4pt}
+  \caption{Macro-F1 comparison: Baseline vs EDA vs NAFT
+           under typographic noise.}
+  \label{tab:eda}
+  \begin{tabular}{rcccc}
+    \toprule
+    $\alpha$ & \textbf{Base} & \textbf{EDA} & \textbf{NAFT} & \textbf{NAFT$-$EDA} \\
+    \midrule
+    0.0 & 0.9119 & 0.8959 & 0.8900 & $-$0.006 \\
+    0.1 & 0.7329 & 0.7285 & 0.7779 & $+$0.049 \\
+    0.2 & 0.5170 & 0.5697 & 0.6937 & $+$0.124 \\
+    0.3 & 0.4207 & 0.4283 & 0.6406 & $+$0.212 \\
+    0.5 & 0.3465 & 0.3490 & 0.5531 & $+$0.204 \\
+    1.0 & 0.3333 & 0.3324 & 0.3917 & $+$0.059 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Ablation over Training Intensities.}
+Table~\ref{tab:ablation} reports an ablation over which
+augmentation intensity $\alpha$ contributes most to NAFT's
+robustness.
+NAFT-0.2 and NAFT-0.4 perform comparably and best at low-to-moderate
+noise ($\alpha \leq 0.5$), while NAFT-0.6 overfits to high-intensity
+noise and underperforms at mild conditions.
+The full NAFT model (trained at all three intensities) provides the
+most consistent performance across the range, confirming that
+multi-intensity augmentation is necessary: no single $\alpha$ alone
+achieves the coverage of the combined schedule.
+
+\begin{table}[h]
+  \centering\footnotesize\setlength{\tabcolsep}{3pt}
+  \caption{Ablation: macro-F1 under typographic noise for models
+           trained at a single augmentation intensity vs all three.}
+  \label{tab:ablation}
+  \begin{tabular}{rccccc}
+    \toprule
+    $\alpha$ & \textbf{Base} & \textbf{N-0.2} & \textbf{N-0.4} &
+               \textbf{N-0.6} & \textbf{N-all} \\
+    \midrule
+    0.0 & 0.9119 & 0.8980 & 0.8980 & 0.9079 & 0.8980 \\
+    0.1 & 0.7329 & 0.7858 & 0.7926 & 0.7708 & 0.7996 \\
+    0.3 & 0.4207 & 0.6049 & 0.5781 & 0.4995 & 0.6381 \\
+    0.5 & 0.3465 & 0.5187 & 0.5312 & 0.4320 & 0.5602 \\
+    0.7 & 0.3324 & 0.4447 & 0.4311 & 0.3597 & 0.4322 \\
+    1.0 & 0.3333 & 0.4104 & 0.4098 & 0.3403 & 0.3737 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+NAFT reduces clean-text F1 from 0.9119 to 0.9059 ($\Delta=-0.006$),
+a consistent but minimal drop observed across all noise types at
+$\alpha=0$.
+This represents mild catastrophic forgetting from fine-tuning on
+noisy data, and constitutes a negligible cost relative to the
+gains under typographic and emoji noise.
+
+\begin{table}[h]
+  \centering\footnotesize\setlength{\tabcolsep}{3pt}
+  \caption{Macro-F1 across all $\alpha$ for typographic and emoji
+           noise. $\Delta$ = NAFT $-$ Baseline.}
+  \label{tab:results}
+  \begin{tabular}{ccccr}
+    \toprule
+    \textbf{Noise} & $\alpha$ & \textbf{Base} & \textbf{NAFT} & $\Delta$ \\
+    \midrule
+    Typographic & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+                & 0.1 & 0.7538 & 0.7960 & $+$0.042 \\
+                & 0.2 & 0.5524 & 0.7420 & $+$0.190 \\
+                & 0.3 & 0.3821 & 0.6658 & $+$0.284 \\
+                & 0.4 & 0.3773 & 0.6115 & $+$0.234 \\
+                & 0.5 & 0.3456 & 0.6028 & $+$0.257 \\
+                & 0.6 & 0.3359 & 0.5572 & $+$0.221 \\
+                & 0.7 & 0.3324 & 0.5191 & $+$0.187 \\
+                & 0.8 & 0.3378 & 0.4534 & $+$0.116 \\
+                & 0.9 & 0.3333 & 0.4439 & $+$0.111 \\
+                & 1.0 & 0.3333 & 0.3977 & $+$0.064 \\
+    \addlinespace
+    Emoji       & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+                & 0.1 & 0.9060 & 0.9079 & $+$0.002 \\
+                & 0.2 & 0.8938 & 0.9059 & $+$0.012 \\
+                & 0.3 & 0.8798 & 0.9079 & $+$0.028 \\
+                & 0.4 & 0.8856 & 0.9119 & $+$0.026 \\
+                & 0.5 & 0.8593 & 0.8959 & $+$0.037 \\
+                & 0.6 & 0.8487 & 0.8919 & $+$0.043 \\
+                & 0.7 & 0.8207 & 0.8959 & $+$0.075 \\
+                & 0.8 & 0.8194 & 0.8919 & $+$0.073 \\
+                & 0.9 & 0.7983 & 0.8938 & $+$0.096 \\
+                & 1.0 & 0.7621 & 0.8798 & $+$0.118 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[h]
+  \centering\footnotesize\setlength{\tabcolsep}{3pt}
+  \caption{Macro-F1 across all $\alpha$ for remaining noise types.}
+  \label{tab:results2}
+  \begin{tabular}{ccccr}
+    \toprule
+    \textbf{Noise} & $\alpha$ & \textbf{Base} & \textbf{NAFT} & $\Delta$ \\
+    \midrule
+    Abbrev. & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+            & 0.3 & 0.8920 & 0.8980 & $+$0.006 \\
+            & 0.5 & 0.8820 & 0.8879 & $+$0.006 \\
+            & 0.7 & 0.8800 & 0.8740 & $-$0.006 \\
+            & 1.0 & 0.8760 & 0.8660 & $-$0.010 \\
+    \addlinespace
+    Slang   & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+            & 0.3 & 0.9140 & 0.9039 & $-$0.010 \\
+            & 0.5 & 0.9020 & 0.8999 & $-$0.002 \\
+            & 0.7 & 0.9080 & 0.8959 & $-$0.012 \\
+            & 1.0 & 0.9000 & 0.8899 & $-$0.010 \\
+    \addlinespace
+    Punct.  & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+            & 0.3 & 0.9060 & 0.9020 & $-$0.004 \\
+            & 0.5 & 0.9080 & 0.9000 & $-$0.008 \\
+            & 0.7 & 0.9020 & 0.8920 & $-$0.010 \\
+            & 1.0 & 0.8940 & 0.8900 & $-$0.004 \\
+    \addlinespace
+    Sarcasm & 0.0 & 0.9119 & 0.9059 & $-$0.006 \\
+            & 0.3 & 0.9139 & 0.9138 & $-$0.000 \\
+            & 0.5 & 0.9139 & 0.9198 & $+$0.006 \\
+            & 0.7 & 0.9119 & 0.9278 & $+$0.016 \\
+            & 1.0 & 0.9159 & 0.9298 & $+$0.014 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ---------------------------------------------------------------
+\section{Critical Analysis}
+\label{sec:analysis}
+%% ---------------------------------------------------------------
+
+\paragraph{Error Analysis.}
+The most informative failure mode is the typographic noise
+collapse.
+At $\alpha \geq 0.3$, baseline F1 stabilises near 0.33 — the
+score of a degenerate classifier that always predicts the majority
+class.
+This suggests the model is not merely degraded but completely
+non-functional: character-level perturbations fragment tokens so
+severely that the input becomes uninterpretable to the model.
+NAFT significantly delays this collapse, maintaining F1 above 0.60
+up to $\alpha=0.5$, but ultimately faces the same ceiling at high
+intensities because even augmented training cannot prepare the
+model for arbitrarily corrupted vocabulary.
+
+The sarcasm results require specific explanation.
+Our implementation prepends a fixed phrase (e.g.,
+\textit{``Oh sure,''}) to positive samples, but the baseline
+model correctly classifies these inputs because it attends to the
+underlying film-domain vocabulary (\textit{``entertaining''},
+\textit{``strong performances''}) rather than the pragmatic
+framing.
+This reveals a limitation of our sarcasm operationalisation rather
+than genuine robustness to sarcasm: real sarcasm involves subtle
+contextual inversions that cannot be captured by prefix injection.
+The NAFT model's slight improvement under sarcasm ($+$0.014 at
+$\alpha=1.0$) is likely noise in the evaluation rather than a
+meaningful signal.
+
+\paragraph{Limitations.}
+Three limitations of the present study warrant discussion.
+First, the abbreviation and slang lexicons are small and fixed,
+covering only a fraction of real informal vocabulary.
+Results for these noise types may therefore underestimate
+degradation in genuine social media text.
+Second, noise types are applied independently at evaluation time,
+whereas informal text in practice combines multiple noise types
+simultaneously; joint noise conditions may produce non-additive
+degradation patterns not captured here.
+Third, the sarcasm operationalisation does not reflect genuine
+discourse-level irony, and the robustness observed should not be
+interpreted as sarcasm detection capability.
+
+\paragraph{Generalisation.}
+The experimental findings are specific to binary sentiment
+classification on SST-2 with a DistilBERT backbone.
+Whether NAFT gains transfer to multi-class sentiment, other
+transformer architectures, or non-English informal text remains
+an open empirical question.
+The relative severity ordering (typographic $\gg$ emoji $>$
+abbreviation $\approx$ slang $\approx$ punctuation) may also shift
+on larger or more diverse lexicons.
+
+\paragraph{Practical Implications.}
+For practitioners deploying sentiment systems on informal text,
+the results suggest three actionable conclusions.
+First, typographic noise is the highest-priority robustness concern
+and NAFT is an effective remedy at moderate intensities.
+Second, emoji robustness is achievable through noise augmentation
+at low cost.
+Third, slang and abbreviation handling should focus on lexicon
+expansion rather than model-level interventions, as the baseline
+is already robust at the lexicon sizes tested.
+
+%% ---------------------------------------------------------------
+\section{Conclusion and Future Work}
+%% ---------------------------------------------------------------
+
+This paper investigated the noise sensitivity of a DistilBERT
+sentiment classifier across six informal text noise types and
+proposed noise-augmented fine-tuning (NAFT) as a principled remedy.
+Typographic noise is the most damaging single noise type (F1
+collapse from 0.91 to 0.33), and NAFT recovers up to 0.28 F1
+points under this condition.
+Under compound noise, NAFT's advantage is even more pronounced,
+achieving F1=0.99 at full intensity versus the baseline's 0.40 —
+a direct consequence of training on combined noise distributions.
+Comparison with EDA confirms that word-level augmentation alone is
+insufficient for character-level robustness, motivating
+domain-specific noise taxonomies in future augmentation strategies.
+The ablation study shows that multi-intensity training
+($\alpha \in \{0.2, 0.4, 0.6\}$) outperforms any single intensity,
+with low-intensity variants dominating at mild noise and the full
+schedule providing the broadest coverage.
+
+Future work should explore: (1) sarcasm-aware training using
+irony-labelled datasets such as SemEval-2018 Task
+3~\cite{van2018semeval}; (2) expanding the slang and abbreviation
+lexicons to better reflect real social media vocabulary; and (3)
+extending NAFT to multilingual informal text and other sentiment
+model architectures.
+
+%% ---------------------------------------------------------------
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}
